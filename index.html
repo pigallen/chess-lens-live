@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101613">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Chess Lens Live</title>
+<style>
+:root{--bg:#101613;--panel:rgba(16,22,19,.88);--fg:#eef2ef;--muted:#9fb0a7;--accent:#5fb48a;--arrow:#ff9a3c;--warn:#ffb46b;--line:rgba(255,255,255,.14)}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent}
+#stage{position:fixed;inset:0}
+video,#overlay{position:absolute;inset:0;width:100%;height:100%}
+video{object-fit:contain;background:#000}
+#overlay{touch-action:none}
+.top{position:fixed;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 10px;background:linear-gradient(var(--panel),transparent);pointer-events:none}
+#status{font-weight:600;text-shadow:0 1px 3px #000}
+#status.warn{color:var(--warn)}
+.sheet{position:fixed;left:0;right:0;bottom:0;padding:12px 14px calc(env(safe-area-inset-bottom,0px) + 12px);background:var(--panel);border-top:1px solid var(--line);display:flex;flex-direction:column;gap:10px;backdrop-filter:blur(6px)}
+.best{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+#best{font-size:34px;font-weight:800;letter-spacing:-.02em}
+#bestFor{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+#eval{font:600 15px ui-monospace,Menlo,monospace}
+#pv{font:13px ui-monospace,Menlo,monospace;color:var(--muted);min-height:1.2em}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button,input{font:600 14px system-ui,sans-serif;border-radius:10px;border:1px solid var(--line);background:rgba(255,255,255,.07);color:var(--fg);padding:10px 12px}
+button{cursor:pointer;flex:1 1 auto}
+button.primary{background:var(--accent);color:#0c1a12;border-color:transparent}
+input{flex:1 1 120px;min-width:0}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;justify-content:center;gap:16px;padding:24px;background:var(--bg);z-index:5}
+#start h1{margin:0;font-size:30px}
+#start p{margin:0;color:var(--muted);max-width:34em}
+#start ol{margin:0;padding-left:20px;color:var(--muted);display:flex;flex-direction:column;gap:6px}
+label.chk{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:13px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div class="top"><div id="status">Starting camera…</div></div>
+
+<div class="sheet" id="sheet" hidden>
+  <div class="best">
+    <div><div id="bestFor">Best move for White</div><div id="best">…</div></div>
+    <div id="eval"></div>
+  </div>
+  <div id="pv"></div>
+  <div class="row">
+    <button id="calBtn">Re-mark corners</button>
+    <button id="undoBtn">Undo</button>
+    <button id="flipBtn">Flip sides</button>
+    <button id="resetBtn">New game</button>
+  </div>
+  <div class="row">
+    <input id="manual" placeholder="Missed a move? Type it (e.g. Nf3)" autocomplete="off" autocapitalize="off">
+    <button id="manualBtn" style="flex:0 0 auto">Add</button>
+  </div>
+  <label class="chk"><input type="checkbox" id="onlyMe" style="flex:0 0 auto"> Only show moves for the side nearest the camera</label>
+</div>
+
+<div id="start">
+  <h1>Chess Lens Live</h1>
+  <p>Watches a real board through your camera, follows the moves as they're played, and shows the best move with an arrow.</p>
+  <ol>
+    <li>Set up the pieces in the starting position.</li>
+    <li>Prop your phone so it sees the whole board and doesn't move. Higher and more overhead is better.</li>
+    <li>Tap the board's 4 corners on screen.</li>
+    <li>Play. After each move, take your hand away for a second so it can see the board.</li>
+  </ol>
+  <button class="primary" id="goBtn" style="flex:0 0 auto;padding:14px">Start camera</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const video=$("video"), ov=$("overlay"), octx=ov.getContext("2d");
+const proc=document.createElement("canvas"), pctx=proc.getContext("2d",{willReadFrequently:true});
+const FILES="abcdefgh";
+
+let game=new Chess(), whiteNear=true;
+let corners=[], H=null;            // corners in video pixels: TL,TR,BR,BL as seen on screen
+let ref=null, prev=null, stillCount=0, handled=true, flash=null;
+let best=null, onlyMe=false;
+const SAMPLE=6, STILL_T=5, STILL_FRAMES=5, CHANGE_T=16;
+
+function setStatus(t,warn){ const s=$("status"); s.textContent=t; s.classList.toggle("warn",!!warn); }
+
+// ---------- camera ----------
+$("goBtn").onclick = async () => {
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=stream; await video.play();
+    $("start").hidden=true; $("sheet").hidden=false;
+    try{ await navigator.wakeLock?.request("screen"); }catch(e){}
+    startCalibration(); loop(); startEngine();
+  }catch(e){
+    setStatus("Couldn't open the camera. Allow camera access, and make sure this page is opened over https in Chrome.", true);
+    $("start").hidden=true; $("sheet").hidden=false;
+  }
+};
+
+// ---------- geometry ----------
+function view(){ // video pixel -> screen pixel
+  const cw=ov.clientWidth, ch=ov.clientHeight, vw=video.videoWidth||1, vh=video.videoHeight||1;
+  const s=Math.min(cw/vw,ch/vh); return {s, ox:(cw-vw*s)/2, oy:(ch-vh*s)/2};
+}
+function toScreen([x,y]){ const v=view(); return [x*v.s+v.ox, y*v.s+v.oy]; }
+function toVideo(x,y){ const v=view(); return [(x-v.ox)/v.s,(y-v.oy)/v.s]; }
+function homography(src,dst){
+  const A=[],b=[];
+  for(let i=0;i<4;i++){ const [x,y]=src[i],[u,v]=dst[i];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]); b.push(u);
+    A.push([0,0,0,x,y,1,-v*x,-v*y]); b.push(v); }
+  for(let c=0;c<8;c++){ let p=c; for(let r=c+1;r<8;r++) if(Math.abs(A[r][c])>Math.abs(A[p][c])) p=r;
+    [A[c],A[p]]=[A[p],A[c]]; [b[c],b[p]]=[b[p],b[c]];
+    for(let r=0;r<8;r++){ if(r===c) continue; const f=A[r][c]/A[c][c]; for(let k=c;k<8;k++) A[r][k]-=f*A[c][k]; b[r]-=f*b[c]; } }
+  const h=b.map((v,i)=>v/A[i][i]); return [...h,1];
+}
+function project(h,x,y){ const w=h[6]*x+h[7]*y+1; return [(h[0]*x+h[1]*y+h[2])/w,(h[3]*x+h[4]*y+h[5])/w]; }
+// grid cell (col j,row i on screen) <-> algebraic square
+function cellToSq(i,j){ return whiteNear ? FILES[j]+(8-i) : FILES[7-j]+(i+1); }
+function sqToCell(sq){ const f=FILES.indexOf(sq[0]), r=+sq[1]; return whiteNear ? [8-r,f] : [r-1,7-f]; }
+function sqCenter(sq){ const [i,j]=sqToCell(sq); return toScreen(project(H,j+.5,i+.5)); }
+
+// ---------- calibration ----------
+function startCalibration(){ corners=[]; H=null; ref=null; best=null; setStatus("Tap the board's TOP-LEFT corner on screen."); }
+const ORDER=["TOP-LEFT","TOP-RIGHT","BOTTOM-RIGHT","BOTTOM-LEFT"];
+ov.addEventListener("pointerdown", e => {
+  if(H) return;
+  const r=ov.getBoundingClientRect(); corners.push(toVideo(e.clientX-r.left,e.clientY-r.top));
+  if(corners.length<4){ setStatus(`Now tap the ${ORDER[corners.length]} corner.`); return; }
+  H=homography([[0,0],[8,0],[8,8],[0,8]],corners);
+  ref=null; handled=true;
+  setStatus(game.history().length ? "Corners set. Keep playing." : "Corners set. Make sure the pieces are in the starting position, then play.");
+  analyze();
+});
+
+// ---------- vision ----------
+function features(){
+  const vw=video.videoWidth, vh=video.videoHeight; if(!vw) return null;
+  const sc=Math.min(1,640/vw); proc.width=Math.round(vw*sc); proc.height=Math.round(vh*sc);
+  pctx.drawImage(video,0,0,proc.width,proc.height);
+  const d=pctx.getImageData(0,0,proc.width,proc.height).data, W=proc.width, Hh=proc.height;
+  const out=new Float32Array(64*SAMPLE*SAMPLE*3); let k=0;
+  for(let i=0;i<8;i++) for(let j=0;j<8;j++)
+    for(let a=0;a<SAMPLE;a++) for(let b=0;b<SAMPLE;b++){
+      const u=j+.2+.6*(b+.5)/SAMPLE, v=i+.2+.6*(a+.5)/SAMPLE;
+      let [x,y]=project(H,u,v); x=Math.round(x*sc); y=Math.round(y*sc);
+      if(x<0||y<0||x>=W||y>=Hh){ out[k++]=0;out[k++]=0;out[k++]=0; continue; }
+      const p=(y*W+x)*4; out[k++]=d[p]; out[k++]=d[p+1]; out[k++]=d[p+2];
+    }
+  return out;
+}
+function squareDiffs(A,B){
+  const n=SAMPLE*SAMPLE*3, res=new Array(64);
+  for(let s=0;s<64;s++){ let t=0; for(let q=s*n;q<(s+1)*n;q++) t+=Math.abs(A[q]-B[q]); res[s]=t/n; }
+  const med=[...res].sort((a,b)=>a-b)[32]; return res.map(v=>Math.max(0,v-med));
+}
+function meanDiff(A,B){ let t=0; for(let q=0;q<A.length;q++) t+=Math.abs(A[q]-B[q]); return t/A.length; }
+
+function moveSquares(m){
+  const s=[m.from,m.to];
+  if(m.flags.includes("k")) s.push(m.color==="w"?"h1":"h8", m.color==="w"?"f1":"f8");
+  if(m.flags.includes("q")) s.push(m.color==="w"?"a1":"a8", m.color==="w"?"d1":"d8");
+  if(m.flags.includes("e")) s.push(m.to[0]+m.from[1]);
+  return s;
+}
+function detectMove(diffs){
+  const bySq={}; for(let i=0;i<8;i++) for(let j=0;j<8;j++) bySq[cellToSq(i,j)]=diffs[i*8+j];
+  const changed=Object.values(bySq).filter(v=>v>CHANGE_T).length;
+  if(changed===0) return {none:true};
+  if(changed>8) return {moved:true};
+  let bestM=null, bestScore=-1e9;
+  for(const m of game.moves({verbose:true})){
+    if(m.promotion && m.promotion!=="q") continue;
+    const S=moveSquares(m), set=new Set(S);
+    const minIn=Math.min(...S.slice(0,2).map(s=>bySq[s]));
+    let maxOut=0; for(const sq in bySq) if(!set.has(sq)) maxOut=Math.max(maxOut,bySq[sq]);
+    const score=minIn-maxOut*0.8;
+    if(score>bestScore){ bestScore=score; bestM=m; }
+  }
+  if(bestM && Math.min(bySq[bestM.from],bySq[bestM.to])>CHANGE_T*0.7 && bestScore>0) return {move:bestM};
+  return {unclear:true};
+}
+
+function loop(){
+  setTimeout(loop, 160);
+  resize(); draw();
+  if(!H || !video.videoWidth) return;
+  const f=features(); if(!f) return;
+  if(prev){
+    const md=meanDiff(f,prev);
+    if(md<STILL_T) stillCount++; else { stillCount=0; handled=false; }
+  }
+  prev=f;
+  if(!ref){ if(stillCount>=STILL_FRAMES){ ref=f; handled=true; } return; }
+  if(handled || stillCount<STILL_FRAMES) return;
+  handled=true;
+  const r=detectMove(squareDiffs(f,ref));
+  if(r.none){ ref=f; return; }
+  if(r.moved){ setStatus("The view changed a lot. If the phone moved, tap Re-mark corners.", true); ref=f; return; }
+  if(r.unclear){ setStatus("Saw a change but couldn't tell which move. Type it below.", true); return; }
+  game.move(r.move); ref=f;
+  flash={sqs:[r.move.from,r.move.to],t:Date.now()};
+  setStatus(`Saw ${r.move.san}.`);
+  analyze();
+}
+
+// ---------- drawing ----------
+function resize(){ const w=ov.clientWidth,h=ov.clientHeight,dpr=devicePixelRatio||1;
+  if(ov.width!==Math.round(w*dpr)){ ov.width=Math.round(w*dpr); ov.height=Math.round(h*dpr); } octx.setTransform(dpr,0,0,dpr,0,0); }
+function draw(){
+  octx.clearRect(0,0,ov.clientWidth,ov.clientHeight);
+  if(!H){ octx.fillStyle="#ff9a3c"; for(const c of corners){ const [x,y]=toScreen(c); octx.beginPath(); octx.arc(x,y,9,0,7); octx.fill(); } return; }
+  octx.strokeStyle="rgba(95,180,138,.55)"; octx.lineWidth=1.5;
+  for(let k=0;k<=8;k++){ line(project(H,k,0),project(H,k,8)); line(project(H,0,k),project(H,8,k)); }
+  if(flash && Date.now()-flash.t<1500){ octx.fillStyle="rgba(95,180,138,.35)"; for(const s of flash.sqs) fillSq(s); }
+  if(best){
+    octx.fillStyle="rgba(255,154,60,.28)"; fillSq(best.slice(0,2)); fillSq(best.slice(2,4));
+    const [x1,y1]=sqCenter(best.slice(0,2)), [x2,y2]=sqCenter(best.slice(2,4));
+    const a=Math.atan2(y2-y1,x2-x1), cell=Math.hypot(...sub(sqCenter("a1"),sqCenter("a2")))||30, hw=cell*.32;
+    octx.strokeStyle="#ff9a3c"; octx.fillStyle="#ff9a3c"; octx.lineWidth=cell*.18; octx.lineCap="round";
+    const ex=x2-Math.cos(a)*hw*1.4, ey=y2-Math.sin(a)*hw*1.4;
+    octx.beginPath(); octx.moveTo(x1,y1); octx.lineTo(ex,ey); octx.stroke();
+    octx.beginPath(); octx.moveTo(x2,y2); octx.lineTo(ex+Math.cos(a+1.57)*hw,ey+Math.sin(a+1.57)*hw); octx.lineTo(ex+Math.cos(a-1.57)*hw,ey+Math.sin(a-1.57)*hw); octx.fill();
+  }
+}
+const sub=(p,q)=>[p[0]-q[0],p[1]-q[1]];
+function line(a,b){ const [x1,y1]=toScreen(a),[x2,y2]=toScreen(b); octx.beginPath(); octx.moveTo(x1,y1); octx.lineTo(x2,y2); octx.stroke(); }
+function fillSq(sq){ const [i,j]=sqToCell(sq); const pts=[[j,i],[j+1,i],[j+1,i+1],[j,i+1]].map(p=>toScreen(project(H,p[0],p[1])));
+  octx.beginPath(); octx.moveTo(...pts[0]); pts.slice(1).forEach(p=>octx.lineTo(...p)); octx.closePath(); octx.fill(); }
+
+// ---------- engine ----------
+let engine=null, curScore=null;
+const SF=["https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js","https://cdn.jsdelivr.net/npm/stockfish@10.0.2/src/stockfish.js"];
+function startEngine(i=0){
+  if(i>=SF.length){ setStatus("The chess engine couldn't load. Check your internet connection and reload.", true); return; }
+  let w; try{ w=new Worker(URL.createObjectURL(new Blob([`importScripts(${JSON.stringify(SF[i])});`],{type:"application/javascript"}))); }catch(e){ return startEngine(i+1); }
+  const t=setTimeout(()=>{ w.terminate(); startEngine(i+1); },15000);
+  w.onerror=()=>{ clearTimeout(t); w.terminate(); if(!engine) startEngine(i+1); };
+  w.onmessage=e=>{ const l=String(e.data);
+    if(l==="uciok"){ clearTimeout(t); engine=w; analyze(); }
+    else if(l.startsWith("info")&&l.includes(" pv ")){ const m=l.match(/score (cp|mate) (-?\d+)/); if(m){ curScore={t:m[1],v:+m[2]}; show(l.split(" pv ")[1].split(" "),false); } }
+    else if(l.startsWith("bestmove")){ const mv=l.split(" ")[1]; if(mv&&mv!=="(none)") show(null,true,mv); }
+  };
+  w.postMessage("uci");
+}
+let lastPv=[];
+function analyze(){
+  best=null; $("best").textContent="…"; $("eval").textContent=""; $("pv").textContent="";
+  const turn=game.turn(), mine=whiteNear?"w":"b";
+  $("bestFor").textContent="Best move for "+(turn==="w"?"White":"Black");
+  if(game.game_over()){ $("best").textContent=game.in_checkmate()?"Checkmate":"Game over"; return; }
+  if(onlyMe && turn!==mine){ $("best").textContent="Waiting for opponent"; $("bestFor").textContent=(turn==="w"?"White":"Black")+" to move"; return; }
+  if(!engine) return;
+  curScore=null; lastPv=[];
+  engine.postMessage("stop"); engine.postMessage("position fen "+game.fen()); engine.postMessage("go movetime 2000");
+}
+function show(pv,final,bm){
+  if(pv) lastPv=pv; const line=lastPv.length?lastPv:[bm];
+  const g=new Chess(game.fen()), sans=[];
+  for(const u of line.slice(0,6)){ const r=g.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]||"q"}); if(!r) break; sans.push(r.san); }
+  if(!sans.length) return;
+  best=line[0]; $("best").textContent=sans[0];
+  if(curScore){ const sign=game.turn()==="w"?1:-1;
+    $("eval").textContent = curScore.t==="mate" ? `Mate in ${Math.abs(curScore.v)}` : ((curScore.v*sign/100)>0?"+":"")+(curScore.v*sign/100).toFixed(1); }
+  $("pv").textContent=sans.join(" ");
+}
+
+// ---------- controls ----------
+$("calBtn").onclick=()=>startCalibration();
+$("undoBtn").onclick=()=>{ const m=game.undo(); if(m){ ref=null; setStatus(`Took back ${m.san}. Put the piece back, then continue.`); analyze(); } };
+$("flipBtn").onclick=()=>{ whiteNear=!whiteNear; setStatus(`${whiteNear?"White":"Black"} is now the side nearest the camera.`); analyze(); };
+$("resetBtn").onclick=()=>{ game=new Chess(); ref=null; setStatus("New game. Set up the starting position."); analyze(); };
+$("onlyMe").onchange=e=>{ onlyMe=e.target.checked; analyze(); };
+function addManual(){ const t=$("manual").value.trim(); if(!t) return;
+  const r=game.move(t,{sloppy:true}); if(!r){ setStatus(`"${t}" isn't a legal move here. Use notation like e4, Nf3, O-O, exd5.`, true); return; }
+  $("manual").value=""; ref=null; setStatus(`Added ${r.san}.`); analyze(); }
+$("manualBtn").onclick=addManual; $("manual").onkeydown=e=>{ if(e.key==="Enter") addManual(); };
+addEventListener("resize",()=>{ resize(); });
+})();
+</script>
+</body>
+</html>
