@@ -32,6 +32,11 @@ input{flex:1 1 120px;min-width:0}
 #start h1{margin:0;font-size:30px}
 #start p{margin:0;color:var(--muted);max-width:34em}
 #start ol{margin:0;padding-left:20px;color:var(--muted);display:flex;flex-direction:column;gap:6px}
+.pal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.pal button{padding:6px 0;font-size:26px;line-height:1.1;font-family:"Segoe UI Symbol","Noto Sans Symbols 2",serif}
+.pal button.w{background:#e9e4d4;color:#111}
+.pal button.b{background:#2a3330;color:#fff}
+.pal button.e{font:600 12px system-ui,sans-serif}
 label.chk{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:13px}
 [hidden]{display:none!important}
 </style>
@@ -49,7 +54,19 @@ label.chk{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:1
     <div id="eval"></div>
   </div>
   <div id="pv"></div>
-  <div class="row">
+  <div id="editPanel" hidden style="display:flex;flex-direction:column;gap:8px">
+    <div style="font-size:13px;color:var(--muted)">Tap a square on the camera picture, then tap the piece that's on it.</div>
+    <div class="pal" id="pal"></div>
+    <div class="row">
+      <button id="turnBtn">White to move</button>
+      <button id="clearBtn">Clear board</button>
+      <button class="primary" id="doneBtn">Done</button>
+    </div>
+  </div>
+  <div class="row" id="mainRow1">
+    <button class="primary" id="setBtn">Set up current position</button>
+  </div>
+  <div class="row" id="mainRow2">
     <button id="calBtn">Re-mark corners</button>
     <button id="undoBtn">Undo</button>
     <button id="flipBtn">Flip sides</button>
@@ -66,7 +83,7 @@ label.chk{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:1
   <h1>Chess Lens Live</h1>
   <p>Watches a real board through your camera, follows the moves as they're played, and shows the best move with an arrow.</p>
   <ol>
-    <li>Set up the pieces in the starting position.</li>
+    <li>Start from the starting position, or tap <b>Set up current position</b> later to enter a game already in progress.</li>
     <li>Prop your phone so it sees the whole board and doesn't move. Higher and more overhead is better.</li>
     <li>Tap the board's 4 corners on screen.</li>
     <li>Play. After each move, take your hand away for a second so it can see the board.</li>
@@ -130,9 +147,22 @@ function sqCenter(sq){ const [i,j]=sqToCell(sq); return toScreen(project(H,j+.5,
 // ---------- calibration ----------
 function startCalibration(){ corners=[]; H=null; ref=null; best=null; setStatus("Tap the board's TOP-LEFT corner on screen."); }
 const ORDER=["TOP-LEFT","TOP-RIGHT","BOTTOM-RIGHT","BOTTOM-LEFT"];
+function inv3(h){
+  const [a,b,c,d,e,f,g,k,l]=h, A=e*l-f*k, B=-(d*l-f*g), C=d*k-e*g, det=a*A+b*B+c*C;
+  const m=[A,-(b*l-c*k),b*f-c*e, B,a*l-c*g,-(a*f-c*d), C,-(a*k-b*g),a*e-b*d].map(x=>x/det);
+  return m.map(x=>x/m[8]);
+}
 ov.addEventListener("pointerdown", e => {
-  if(H) return;
-  const r=ov.getBoundingClientRect(); corners.push(toVideo(e.clientX-r.left,e.clientY-r.top));
+  const r=ov.getBoundingClientRect();
+  if(H){
+    if(!editing) return;
+    const [x,y]=toVideo(e.clientX-r.left,e.clientY-r.top), [u,v]=project(inv3(H),x,y);
+    const j=Math.floor(u), i=Math.floor(v);
+    if(i<0||i>7||j<0||j>7) return;
+    selSq=cellToSq(i,j); setStatus(`Square ${selSq} selected. Now tap the piece below (or Empty).`);
+    return;
+  }
+  corners.push(toVideo(e.clientX-r.left,e.clientY-r.top));
   if(corners.length<4){ setStatus(`Now tap the ${ORDER[corners.length]} corner.`); return; }
   H=homography([[0,0],[8,0],[8,8],[0,8]],corners);
   ref=null; handled=true;
@@ -191,7 +221,7 @@ function detectMove(diffs){
 function loop(){
   setTimeout(loop, 160);
   resize(); draw();
-  if(!H || !video.videoWidth) return;
+  if(!H || !video.videoWidth || editing) return;
   const f=features(); if(!f) return;
   if(prev){
     const md=meanDiff(f,prev);
@@ -219,6 +249,15 @@ function draw(){
   if(!H){ octx.fillStyle="#ff9a3c"; for(const c of corners){ const [x,y]=toScreen(c); octx.beginPath(); octx.arc(x,y,9,0,7); octx.fill(); } return; }
   octx.strokeStyle="rgba(95,180,138,.55)"; octx.lineWidth=1.5;
   for(let k=0;k<=8;k++){ line(project(H,k,0),project(H,k,8)); line(project(H,0,k),project(H,8,k)); }
+  if(editing){
+    if(selSq){ octx.fillStyle="rgba(255,154,60,.45)"; fillSq(selSq); }
+    const cell=Math.hypot(...sub(sqCenter("a1"),sqCenter("a2")))||30;
+    octx.textAlign="center"; octx.textBaseline="middle"; octx.font=`${Math.round(cell*.7)}px "Segoe UI Symbol","Noto Sans Symbols 2",serif`;
+    for(const sq in editBoard){ const p=editBoard[sq], [x,y]=sqCenter(sq), wht=p===p.toUpperCase();
+      octx.lineWidth=3; octx.strokeStyle=wht?"#000":"#fff"; octx.fillStyle=wht?"#fff":"#000";
+      octx.strokeText(GL[p.toLowerCase()],x,y); octx.fillText(GL[p.toLowerCase()],x,y); }
+    return;
+  }
   if(flash && Date.now()-flash.t<1500){ octx.fillStyle="rgba(95,180,138,.35)"; for(const s of flash.sqs) fillSq(s); }
   if(best){
     octx.fillStyle="rgba(255,154,60,.28)"; fillSq(best.slice(0,2)); fillSq(best.slice(2,4));
@@ -271,6 +310,44 @@ function show(pv,final,bm){
     $("eval").textContent = curScore.t==="mate" ? `Mate in ${Math.abs(curScore.v)}` : ((curScore.v*sign/100)>0?"+":"")+(curScore.v*sign/100).toFixed(1); }
   $("pv").textContent=sans.join(" ");
 }
+
+// ---------- set up position ----------
+const GL={k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
+let editing=false, editBoard={}, selSq=null, editTurn="w";
+"KQRBNPkqrbnp.".split("").forEach(c=>{
+  const b=document.createElement("button");
+  if(c==="."){ b.className="e"; b.textContent="Empty"; }
+  else { b.className=c===c.toUpperCase()?"w":"b"; b.textContent=GL[c.toLowerCase()]; }
+  b.onclick=()=>{ if(!selSq){ setStatus("Tap a square on the camera picture first.", true); return; }
+    if(c===".") delete editBoard[selSq]; else editBoard[selSq]=c; };
+  $("pal").appendChild(b);
+});
+function setEditing(on){
+  editing=on; $("editPanel").hidden=!on; $("mainRow1").hidden=on; $("mainRow2").hidden=on;
+  $("manual").parentElement.hidden=on; best=null;
+}
+$("setBtn").onclick=()=>{
+  if(!H){ setStatus("Tap the board's 4 corners first, then set up the position.", true); return; }
+  editBoard={}; for(const row of game.board()) for(const p of row) if(p) editBoard[p.square]=p.color==="w"?p.type.toUpperCase():p.type;
+  editTurn=game.turn(); $("turnBtn").textContent=(editTurn==="w"?"White":"Black")+" to move";
+  selSq=null; setEditing(true); setStatus("Tap a square on the camera picture to change it.");
+};
+$("turnBtn").onclick=()=>{ editTurn=editTurn==="w"?"b":"w"; $("turnBtn").textContent=(editTurn==="w"?"White":"Black")+" to move"; };
+$("clearBtn").onclick=()=>{ editBoard={}; selSq=null; setStatus("Board cleared. Tap squares to place each piece."); };
+$("doneBtn").onclick=()=>{
+  let rows=[];
+  for(let r=8;r>=1;r--){ let s="",e=0; for(const f of FILES){ const p=editBoard[f+r]; if(p){ if(e){s+=e;e=0;} s+=p; } else e++; } rows.push(s+(e||"")); }
+  const B=editBoard; let c="";
+  if(B.e1==="K"){ if(B.h1==="R") c+="K"; if(B.a1==="R") c+="Q"; }
+  if(B.e8==="k"){ if(B.h8==="r") c+="k"; if(B.a8==="r") c+="q"; }
+  const fen=`${rows.join("/")} ${editTurn} ${c||"-"} - 0 1`;
+  const g=new Chess(), v=g.validate_fen(fen);
+  if(!v.valid){ setStatus("That position isn't legal: "+v.error.replace(/^.*?: /,"")+" Check the kings and pawns.", true); return; }
+  const other=new Chess(fen.replace(/ [wb] /, editTurn==="w"?" b ":" w "));
+  if(other.in_check()){ setStatus(`${editTurn==="w"?"Black":"White"} is in check, so it must be ${editTurn==="w"?"Black":"White"} to move. Tap the "to move" button.`, true); return; }
+  game=new Chess(fen); ref=null; selSq=null; setEditing(false);
+  setStatus("Position set."); analyze();
+};
 
 // ---------- controls ----------
 $("calBtn").onclick=()=>startCalibration();
